@@ -1,0 +1,245 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      module:
+        description: "Gradle module that produces the APK"
+        required: false
+        default: "app"
+        type: string
+      project_dir:
+        description: "Android project dir containing ./gradlew (blank = auto-detect)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned toolchain. Bump deliberately, in one place.
+  JAVA_VERSION: "17"
+  ANDROID_PLATFORM: "android-35"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  ANDROID_CMDLINE_TOOLS_VERSION: "11076708"
+  ANDROID_CMDLINE_TOOLS_SHA256: "2d2d50857e4eb553af5a6dc3ad507a17adf43d115264b1afc116f95c92e5e258"
+  FLUTTER_VERSION: "3.24.5"
+  NODE_VERSION: "20"
+  # Keep Gradle inside the runner's memory budget and never leave daemons behind.
+  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false -Dorg.gradle.parallel=false"
+  MODULE: ${{ github.event.inputs.module || 'app' }}
+  PROJECT_DIR_INPUT: ${{ github.event.inputs.project_dir || '' }}
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      # `secrets` is not available in step-level `if:`; evaluate it once here.
+      HAS_RELEASE_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Cache Android SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/android-sdk
+          key: android-sdk-${{ runner.os }}-${{ env.ANDROID_PLATFORM }}-bt${{ env.ANDROID_BUILD_TOOLS }}-ct${{ env.ANDROID_CMDLINE_TOOLS_VERSION }}
+
+      - name: Install pinned Android SDK
+        run: |
+          set -euo pipefail
+          SDK_ROOT="$HOME/android-sdk"
+          CT_DIR="cmdline-tools/16.0"
+          if [ ! -d "$SDK_ROOT/$CT_DIR" ]; then
+            echo "Installing Android command-line tools $ANDROID_CMDLINE_TOOLS_VERSION"
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            curl -fsSL -o /tmp/cmdline-tools.zip \
+              "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_VERSION}_latest.zip"
+            echo "${ANDROID_CMDLINE_TOOLS_SHA256}  /tmp/cmdline-tools.zip" | sha256sum -c -
+            unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools-unpack
+            mv /tmp/cmdline-tools-unpack/cmdline-tools "$SDK_ROOT/$CT_DIR"
+            rm -rf /tmp/cmdline-tools-unpack /tmp/cmdline-tools.zip
+          fi
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export PATH="$SDK_ROOT/$CT_DIR/bin:$SDK_ROOT/platform-tools:$PATH"
+          # `yes` gets SIGPIPE when sdkmanager stops reading; that is expected.
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}"
+          {
+            echo "ANDROID_HOME=$SDK_ROOT"
+            echo "ANDROID_SDK_ROOT=$SDK_ROOT"
+          } >> "$GITHUB_ENV"
+          {
+            echo "$SDK_ROOT/$CT_DIR/bin"
+            echo "$SDK_ROOT/platform-tools"
+            echo "$SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS"
+          } >> "$GITHUB_PATH"
+
+      - name: Detect stack
+        id: detect
+        run: |
+          set -euo pipefail
+          gradle_project() {
+            # Wrappers are often committed without the exec bit; fix it instead of failing.
+            [ -x "$1/gradlew" ] || chmod +x "$1/gradlew"
+            echo "stack=gradle" >> "$GITHUB_OUTPUT"
+            echo "project_dir=$1" >> "$GITHUB_OUTPUT"
+            echo "Detected Gradle project in '$1'"
+          }
+
+          if [ -n "$PROJECT_DIR_INPUT" ]; then
+            if [ ! -f "$PROJECT_DIR_INPUT/gradlew" ]; then
+              echo "::error::No gradlew in '$PROJECT_DIR_INPUT'. Point project_dir at the directory that contains it."
+              exit 1
+            fi
+            gradle_project "$PROJECT_DIR_INPUT"
+            exit 0
+          fi
+
+          # React Native and Capacitor also build through the Gradle wrapper.
+          if [ -f package.json ] && grep -q '"expo"' package.json && [ ! -x android/gradlew ]; then
+            echo "stack=expo" >> "$GITHUB_OUTPUT"
+            echo "project_dir=android" >> "$GITHUB_OUTPUT"
+            echo "Detected Expo project that needs prebuild"
+            exit 0
+          fi
+
+          if [ -f pubspec.yaml ] && grep -q 'sdk: *flutter' pubspec.yaml; then
+            echo "stack=flutter" >> "$GITHUB_OUTPUT"
+            echo "project_dir=." >> "$GITHUB_OUTPUT"
+            echo "Detected Flutter project"
+            exit 0
+          fi
+
+          wrapper="$(find . -maxdepth 3 -type f -name gradlew -not -path '*/node_modules/*' | head -n 1)"
+          if [ -n "$wrapper" ]; then
+            gradle_project "$(dirname "$wrapper")"
+            exit 0
+          fi
+
+          echo "::error::No Android project found: no gradlew, no Flutter pubspec.yaml, no Expo package.json."
+          echo "This repository currently has no Android module to build. Add one, or pass project_dir."
+          exit 1
+
+      - name: Set up Node ${{ env.NODE_VERSION }}
+        if: steps.detect.outputs.stack == 'expo'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Expo prebuild
+        if: steps.detect.outputs.stack == 'expo'
+        run: |
+          set -euo pipefail
+          npm ci
+          npx expo prebuild --platform android --no-install
+
+      - name: Set up Flutter ${{ env.FLUTTER_VERSION }}
+        if: steps.detect.outputs.stack == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Build debug APK (Gradle)
+        if: steps.detect.outputs.stack == 'gradle' || steps.detect.outputs.stack == 'expo'
+        working-directory: ${{ steps.detect.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace ":${MODULE}:assembleDebug"
+
+      - name: Build debug APK (Flutter)
+        if: steps.detect.outputs.stack == 'flutter'
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter build apk --debug
+
+      # Release builds only run when the repo already carries signing secrets.
+      - name: Build release APK (signed, secrets required)
+        if: env.HAS_RELEASE_KEYSTORE == 'true' && (steps.detect.outputs.stack == 'gradle' || steps.detect.outputs.stack == 'expo')
+        working-directory: ${{ steps.detect.outputs.project_dir }}
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEYSTORE="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace ":${MODULE}:assembleRelease" \
+            -Pandroid.injected.signing.store.file="$KEYSTORE" \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD"
+          rm -f "$KEYSTORE"
+
+      - name: Remove temporary keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.keystore"
+
+      - name: Collect APK and fail if none was produced
+        id: apk
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          mapfile -t apks < <(find . -type f -name '*.apk' \
+            \( -path '*/build/outputs/apk/debug/*' \
+            -o -path '*/build/outputs/apk/release/*' \
+            -o -path '*/build/app/outputs/flutter-apk/*' \) | sort)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::Build finished but no APK was found under */build/outputs/apk/**/*.apk"
+            exit 1
+          fi
+          AAPT="$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}/aapt2"
+          {
+            echo "### APKs produced"
+            echo ""
+            echo "| file | size | sha256 | package |"
+            echo "| --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for apk in "${apks[@]}"; do
+            name="$(basename "$apk")"
+            if [ -e "artifacts/$name" ]; then
+              name="$(echo "${apk#./}" | tr '/' '-')"
+            fi
+            cp "$apk" "artifacts/$name"
+            badging=""
+            if [ -x "$AAPT" ]; then
+              badging="$("$AAPT" dump badging "$apk" 2>/dev/null | head -n 1 || true)"
+            fi
+            echo "$name: $(du -h "artifacts/$name" | cut -f1) ${badging}"
+            echo "| $name | $(du -h "artifacts/$name" | cut -f1) | $(sha256sum "$apk" | cut -d' ' -f1) | ${badging:-unknown} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          ls -l artifacts
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk-${{ github.run_number }}
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FlowBoard</string>
+    <string name="ime_name">FlowBoard keyboard</string>
+    <string name="subtype_en_us">English (US)</string>
+    <string name="settings_title">FlowBoard settings</string>
+    <string name="onboarding_title">FlowBoard setup</string>
+</resources>

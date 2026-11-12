@@ -1,0 +1,12 @@
+{
+  "name": "FlowBoard Android",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "postCreateCommand": "java -version && sdkmanager --list_installed",
+  "customizations": {
+    "vscode": {
+      "extensions": ["vscjava.vscode-java-pack"]
+    }
+  }
+}
