@@ -29,6 +29,24 @@ gh run watch "$(gh run list --workflow=build-apk.yml --limit 1 --json databaseId
 gh run download "$(gh run list --workflow=build-apk.yml --limit 1 --json databaseId --jq '.[0].databaseId')" -D dist
 ```
 
+## Design documents
+
+The proposed stenographic input language and its prediction layer are specified (not implemented) in
+`docs/`:
+
+- [`docs/stenographic_research.md`](docs/stenographic_research.md) — stenotype/Plover theory, English
+  phonology, chording and disambiguation evidence, with sources
+- [`docs/flowboard_language_design.md`](docs/flowboard_language_design.md) — the 16-chord inventory,
+  composition rules, briefs, dictionary and ambiguity model
+- [`docs/input_language_examples.md`](docs/input_language_examples.md) — 41 generated, consistent
+  stroke sequences
+- [`docs/context_prediction_architecture.md`](docs/context_prediction_architecture.md) — ranking,
+  algorithms and fallbacks
+- [`docs/architecture_proposal.md`](docs/architecture_proposal.md) — components, interfaces and
+  migration phases
+- [`docs/evaluation_plan.md`](docs/evaluation_plan.md) — metrics, estimates and study design
+- [`docs/decision_record.md`](docs/decision_record.md) — the recommendation and its open questions
+
 ## Install and enable
 
 ```bash
