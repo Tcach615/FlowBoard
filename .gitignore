@@ -10,3 +10,4 @@ captures/
 app/build/
 artifacts/
 *.apk
+.kotlin/

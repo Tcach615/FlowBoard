@@ -16,6 +16,11 @@ in `.devcontainer/`; CI builds the same way.
 
 The APK lands at `app/build/outputs/apk/debug/app-debug.apk`.
 
+`testDebugUnitTest` also runs the headless end-to-end suite (`HeadlessTypingTest`,
+`HeadlessScreensTest`), which drives the real IME service and views with synthetic two-thumb
+gestures and writes rendered screens to `build/reports/headless/`. What still needs a real device
+is listed in [MANUAL_QA.md](MANUAL_QA.md).
+
 On demand from GitHub Actions:
 
 ```bash
