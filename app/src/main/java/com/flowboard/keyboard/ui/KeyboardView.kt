@@ -14,17 +14,25 @@ import android.view.MotionEvent
 import android.view.View
 import com.flowboard.keyboard.gesture.Chord
 import com.flowboard.keyboard.gesture.Direction
+import com.flowboard.keyboard.gesture.FingerRole
 import com.flowboard.keyboard.gesture.GestureEngine
 import com.flowboard.keyboard.gesture.ZoneLayout
-import com.flowboard.keyboard.model.Candidate
 import com.flowboard.keyboard.settings.FlowBoardPreferences
+import com.flowboard.keyboard.steno.ChordPrediction
+import com.flowboard.keyboard.steno.Fsl
+import com.flowboard.keyboard.steno.StenoSession
+import com.flowboard.keyboard.steno.Translation
 
 /**
- * The keyboard surface: a compact toolbar, a composing preview and two directional pads.
+ * The stenographic keyboard surface.
  *
- * Candidate labels on the left pad are the four candidates for the right-hand direction
- * currently in play (and vice versa), which is how all sixteen chords stay visible without
- * a 16-cell grid.
+ * The pads no longer show candidate words. They show the **fixed FSL-1 alphabet** — onset families
+ * on the left, nucleus families (plus the bare `∅` marker) on the right — because a chord whose
+ * label changed with prediction would be impossible to learn
+ * (`docs/flowboard_language_design.md`, invariant I6).
+ *
+ * Above the pads: the live sketch, the ordered dictionary candidates (tap to commit one), and
+ * prediction rings around likely next chords.
  */
 class KeyboardView @JvmOverloads constructor(
     context: Context,
@@ -34,6 +42,7 @@ class KeyboardView @JvmOverloads constructor(
     interface Listener {
         fun onChord(chord: Chord)
         fun onCommand(command: Command)
+        fun onSelectCandidate(index: Int)
     }
 
     enum class Command { BACKSPACE, SPACE, COMPLETE, UNDO, ALTERNATIVES }
@@ -43,26 +52,31 @@ class KeyboardView @JvmOverloads constructor(
     private val density = resources.displayMetrics.density
     private fun dp(value: Float): Float = value * density
 
-    private var board: Map<Chord, Candidate> = emptyMap()
-    private var composingText: String = ""
-    private var statusText: String = ""
+    private var sketchText: String = ""
+    private var candidates: List<String> = emptyList()
+    private var selected: Int = 0
+    private var predictions: List<ChordPrediction> = emptyList()
+    private var hintText: String = ""
+    private var statusText = ""
     private var privateMode = false
     private var haptics = true
     private var showLabels = true
+    private var showHighlights = true
     private var darkTheme = true
     private var deadZone = FlowBoardPreferences.DEFAULT_DEAD_ZONE
     private var syncWindowMs = FlowBoardPreferences.DEFAULT_SYNC_WINDOW.toLong()
 
     private var snapshot: GestureEngine.Snapshot? = null
     private var pressedCommand: Command? = null
+    private var pressedCandidate: Int? = null
     private var zoneLayout: ZoneLayout? = null
     private var buttons: List<Pair<Command, RectF>> = emptyList()
+    private var chips: List<Pair<Int, RectF>> = emptyList()
     private var previewRect = RectF()
-    private var toolbarTop = 0f
+    private var chipRect = RectF()
     private var statusExpiry = 0L
 
     private val renderer = ZoneRenderer(context)
-
     private lateinit var engine: GestureEngine
 
     private val tickRunnable = Runnable {
@@ -92,20 +106,32 @@ class KeyboardView @JvmOverloads constructor(
     private val toolbarPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#161D28") }
     private val pressedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#2C4472") }
     private val previewPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#121924") }
+    private val chipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#1B2431") }
+    private val chipSelectedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#2C4472") }
     private val composingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#E7ECF6")
-        textSize = dp(17f)
+        textSize = dp(15f)
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     }
-    private var statusColor = Color.parseColor("#8FA0BD")
     private val statusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = statusColor
-        textSize = dp(11f)
+        color = Color.parseColor("#8FA0BD")
+        textSize = dp(10f)
         textAlign = Paint.Align.RIGHT
+    }
+    private val chipTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#D6DEEC")
+        textSize = dp(12f)
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+    }
+    private val chipIndexPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#6E9BFF")
+        textSize = dp(9f)
+        textAlign = Paint.Align.CENTER
     }
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#D6DEEC")
-        textSize = dp(17f)
+        textSize = dp(16f)
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     }
@@ -119,24 +145,34 @@ class KeyboardView @JvmOverloads constructor(
     fun applyPreferences(preferences: FlowBoardPreferences) {
         haptics = preferences.hapticsEnabled
         showLabels = preferences.showCandidateLabels
+        showHighlights = preferences.predictionHighlights
         darkTheme = preferences.theme != "light"
         deadZone = preferences.deadZone
         syncWindowMs = preferences.syncWindowMs.toLong()
         engine.updateConfig(GestureEngine.Config(syncWindowMs = syncWindowMs))
         renderer.setDarkTheme(darkTheme)
         applyPalette()
-        // The dead zone and sync window change the geometry; rebuild in place (no resize event follows).
         if (width > 0 && height > 0) buildLayout(width.toFloat(), height.toFloat())
         invalidate()
     }
 
-    fun setBoard(mapping: Map<Chord, Candidate>) {
-        board = mapping
-        invalidate()
-    }
-
-    fun setComposingPreview(text: String) {
-        composingText = text
+    /** Applies a full linguistic state; safe to call after every chord. */
+    fun setSession(state: StenoSession.Snapshot) {
+        sketchText = state.key
+        candidates = when (val translation = state.translation) {
+            is Translation.Candidates -> translation.words
+            else -> emptyList()
+        }
+        hintText = when (val translation = state.translation) {
+            is Translation.Candidates -> ""
+            is Translation.Incomplete -> translation.reason
+            Translation.Empty -> ""
+        }
+        selected = state.selected.coerceIn(0, (candidates.size - 1).coerceAtLeast(0))
+        predictions = state.predictions
+        if (chipRect.width() > 0f) {
+            chips = buildChips(chipRect, maxOf(candidates.size, 1))
+        }
         invalidate()
     }
 
@@ -159,7 +195,7 @@ class KeyboardView @JvmOverloads constructor(
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val width = MeasureSpec.getSize(widthMeasureSpec)
         val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-        val desired = dp(if (landscape) 210f else 330f).toInt()
+        val desired = dp(if (landscape) 235f else 348f).toInt()
         setMeasuredDimension(width, resolveSize(desired, heightMeasureSpec))
     }
 
@@ -169,8 +205,8 @@ class KeyboardView @JvmOverloads constructor(
     }
 
     private fun buildLayout(width: Float, height: Float) {
-        toolbarTop = dp(4f)
-        val toolbarHeight = dp(42f)
+        val toolbarTop = dp(4f)
+        val toolbarHeight = dp(40f)
         val toolbarRect = RectF(dp(6f), toolbarTop, width - dp(6f), toolbarTop + toolbarHeight)
         val commands = Command.entries
         val buttonWidth = toolbarRect.width() / commands.size
@@ -180,9 +216,13 @@ class KeyboardView @JvmOverloads constructor(
         }
 
         val previewTop = toolbarRect.bottom + dp(4f)
-        previewRect = RectF(dp(6f), previewTop, width - dp(6f), previewTop + dp(34f))
+        previewRect = RectF(dp(6f), previewTop, width - dp(6f), previewTop + dp(28f))
 
-        val zoneTop = previewRect.bottom + dp(2f)
+        val chipTop = previewRect.bottom + dp(4f)
+        chipRect = RectF(dp(6f), chipTop, width - dp(6f), chipTop + dp(32f))
+        chips = buildChips(chipRect, maxOf(candidates.size, 1))
+
+        val zoneTop = chipRect.bottom + dp(2f)
         val zoneHeight = (height - zoneTop - dp(2f)).coerceAtLeast(dp(120f))
         val radius = minOf(width * 0.215f, zoneHeight * 0.44f)
         val centerY = zoneTop + zoneHeight / 2f
@@ -200,85 +240,122 @@ class KeyboardView @JvmOverloads constructor(
         engine.setLayout(layout)
     }
 
+    private fun buildChips(area: RectF, count: Int): List<Pair<Int, RectF>> {
+        val slots = count.coerceIn(1, MAX_CHIPS)
+        val gap = dp(4f)
+        val width = (area.width() - gap * (slots - 1)) / slots
+        return (0 until slots).map { index ->
+            val left = area.left + index * (width + gap)
+            index to RectF(left, area.top, left + width, area.bottom)
+        }
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), backgroundPaint)
         drawToolbar(canvas)
         drawPreview(canvas)
+        drawChips(canvas)
 
         val layout = zoneLayout ?: return
-        val currentSnapshot = snapshot
-        val anchorLeft = currentSnapshot?.leftDirection
-            ?: currentSnapshot?.lastChord?.left
-            ?: Direction.NW
-        val anchorRight = currentSnapshot?.rightDirection
-            ?: currentSnapshot?.lastChord?.right
-            ?: Direction.NE
-
-        val leftLabels = Direction.entries.associateWith { direction ->
-            board[Chord(direction, anchorRight)]?.let { displayText(it) }
-        }
-        val rightLabels = Direction.entries.associateWith { direction ->
-            board[Chord(anchorLeft, direction)]?.let { displayText(it) }
-        }
+        val current = snapshot
+        val (leftHighlights, rightHighlights) = highlightMaps()
 
         renderer.draw(
             canvas = canvas,
             layout = layout,
-            leftLabels = leftLabels,
-            rightLabels = rightLabels,
-            leftActive = currentSnapshot?.leftDirection,
-            rightActive = currentSnapshot?.rightDirection,
-            leftConnected = currentSnapshot?.leftDirection != null,
-            rightConnected = currentSnapshot?.rightDirection != null,
-            showLabels = showLabels
+            leftLabels = Fsl.leftPadLabels(),
+            rightLabels = Fsl.rightPadLabels(),
+            leftActive = current?.leftDirection,
+            rightActive = current?.rightDirection,
+            leftConnected = current?.leftDirection != null,
+            rightConnected = current?.rightDirection != null,
+            showLabels = showLabels,
+            leftHighlights = leftHighlights,
+            rightHighlights = rightHighlights
         )
     }
 
-    private fun displayText(candidate: Candidate): String = when (candidate.kind) {
-        com.flowboard.keyboard.model.CandidateKind.SPACE -> "space"
-        com.flowboard.keyboard.model.CandidateKind.PUNCTUATION -> candidate.text
-        else -> candidate.text
+    private fun highlightMaps(): Pair<Map<Direction, Float>, Map<Direction, Float>> {
+        if (!showHighlights || predictions.isEmpty()) return emptyMap<Direction, Float>() to emptyMap()
+        val left = HashMap<Direction, Float>()
+        val right = HashMap<Direction, Float>()
+        for (prediction in predictions) {
+            val chord = prediction.chord
+            left[chord.left] = maxOf(left[chord.left] ?: 0f, prediction.score.toFloat())
+            right[chord.right] = maxOf(right[chord.right] ?: 0f, prediction.score.toFloat())
+        }
+        return left to right
     }
 
     private fun drawToolbar(canvas: Canvas) {
         for ((command, rect) in buttons) {
-            canvas.drawRoundRect(rect, dp(10f), dp(10f), if (command == pressedCommand) pressedPaint else toolbarPaint)
-            iconPaint.textSize = dp(16f)
-            canvas.drawText(
-                iconFor(command),
-                rect.centerX(),
-                rect.centerY() + iconPaint.textSize / 3f,
-                iconPaint
+            canvas.drawRoundRect(
+                rect, dp(10f), dp(10f),
+                if (command == pressedCommand) pressedPaint else toolbarPaint
             )
+            iconPaint.textSize = dp(16f)
+            canvas.drawText(iconFor(command), rect.centerX(), rect.centerY() + iconPaint.textSize / 3f, iconPaint)
         }
     }
 
     private fun drawPreview(canvas: Canvas) {
-        canvas.drawRoundRect(previewRect, dp(10f), dp(10f), previewPaint)
+        canvas.drawRoundRect(previewRect, dp(9f), dp(9f), previewPaint)
         composingPaint.color = if (darkTheme) Color.parseColor("#E7ECF6") else Color.parseColor("#1A2333")
-        statusColor = if (darkTheme) Color.parseColor("#8FA0BD") else Color.parseColor("#5A6A85")
-        statusPaint.color = statusColor
+        composingPaint.textSize = dp(14f)
 
-        val text = if (composingText.isEmpty()) "Two thumbs, four directions" else composingText
-        composingPaint.textSize = dp(17f)
+        val shown = when {
+            sketchText.isNotEmpty() -> sketchText
+            hintText.isNotEmpty() -> hintText
+            else -> "Left = onset · right = nucleus"
+        }
         canvas.save()
-        canvas.clipRect(previewRect.left + dp(10f), previewRect.top, previewRect.right - dp(120f), previewRect.bottom)
-        canvas.drawText(
-            text,
-            previewRect.left + dp(10f),
-            previewRect.centerY() + composingPaint.textSize / 3f,
-            composingPaint
-        )
+        canvas.clipRect(previewRect.left + dp(10f), previewRect.top, previewRect.right - dp(96f), previewRect.bottom)
+        canvas.drawText(shown, previewRect.left + dp(10f), previewRect.centerY() + composingPaint.textSize / 3f, composingPaint)
         canvas.restore()
 
-        val right = if (privateMode) "PRIVATE" else if (statusText.isNotEmpty() &&
-            (statusExpiry == 0L || SystemClock.uptimeMillis() < statusExpiry)
-        ) statusText else ""
+        val right = when {
+            privateMode -> "PRIVATE"
+            statusText.isNotEmpty() && (statusExpiry == 0L || SystemClock.uptimeMillis() < statusExpiry) -> statusText
+            else -> ""
+        }
         if (right.isNotEmpty()) {
-            statusPaint.textSize = dp(11f)
-            statusPaint.color = if (privateMode) Color.parseColor("#F0B429") else statusColor
-            canvas.drawText(right, previewRect.right - dp(10f), previewRect.centerY() + dp(4f), statusPaint)
+            statusPaint.textSize = dp(10f)
+            statusPaint.color = if (privateMode) Color.parseColor("#F0B429") else Color.parseColor("#8FA0BD")
+            canvas.drawText(right, previewRect.right - dp(10f), previewRect.centerY() + dp(3.5f), statusPaint)
+        }
+    }
+
+    private fun drawChips(canvas: Canvas) {
+        val slots = chips
+        if (slots.isEmpty()) return
+        if (candidates.isEmpty()) {
+            chipPaint.color = if (darkTheme) Color.parseColor("#151C27") else Color.parseColor("#EDF1F8")
+            canvas.drawRoundRect(chipRect, dp(9f), dp(9f), chipPaint)
+            chipTextPaint.color = if (darkTheme) Color.parseColor("#5C6B85") else Color.parseColor("#7A879E")
+            chipTextPaint.textSize = dp(11f)
+            val message = if (sketchText.isEmpty()) "stroke a word · tap a candidate to commit" else hintText.ifEmpty { "no word for this sketch" }
+            canvas.drawText(message, chipRect.centerX(), chipRect.centerY() + dp(4f), chipTextPaint)
+            chipTextPaint.color = if (darkTheme) Color.parseColor("#D6DEEC") else Color.parseColor("#2A3448")
+            return
+        }
+
+        val visible = minOf(candidates.size, slots.size)
+        for (index in 0 until visible) {
+            val rect = slots[index].second
+            val isSelected = index == selected
+            canvas.drawRoundRect(rect, dp(9f), dp(9f), if (isSelected) chipSelectedPaint else chipPaint)
+            chipIndexPaint.textSize = dp(9f)
+            canvas.drawText("${index + 1}", rect.centerX(), rect.top + dp(9f), chipIndexPaint)
+            chipTextPaint.color = if (isSelected) Color.WHITE else Color.parseColor("#D6DEEC")
+            chipTextPaint.textSize = dp(12f)
+            val word = candidates[index]
+            val fitted = if (chipTextPaint.measureText(word) > rect.width() - dp(10f)) {
+                word.take(maxOf(3, (rect.width() / dp(7f)).toInt())) + "…"
+            } else {
+                word
+            }
+            canvas.drawText(fitted, rect.centerX(), rect.centerY() + dp(4f), chipTextPaint)
         }
     }
 
@@ -293,9 +370,13 @@ class KeyboardView @JvmOverloads constructor(
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                val command = commandAt(event.x, event.y)
-                if (command != null) {
-                    pressedCommand = command
+                commandAt(event.x, event.y)?.let {
+                    pressedCommand = it
+                    invalidate()
+                    return true
+                }
+                chipAt(event.x, event.y)?.let {
+                    pressedCandidate = it
                     invalidate()
                     return true
                 }
@@ -304,34 +385,36 @@ class KeyboardView @JvmOverloads constructor(
 
             MotionEvent.ACTION_POINTER_DOWN -> {
                 val index = event.actionIndex
-                engine.onDown(
-                    event.getPointerId(index), event.getX(index), event.getY(index), event.eventTime
-                )
+                engine.onDown(event.getPointerId(index), event.getX(index), event.getY(index), event.eventTime)
             }
 
             MotionEvent.ACTION_MOVE -> {
                 for (index in 0 until event.pointerCount) {
-                    engine.onMove(
-                        event.getPointerId(index), event.getX(index), event.getY(index), event.eventTime
-                    )
+                    engine.onMove(event.getPointerId(index), event.getX(index), event.getY(index), event.eventTime)
                 }
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
                 val index = event.actionIndex
-                engine.onUp(
-                    event.getPointerId(index), event.getX(index), event.getY(index), event.eventTime
-                )
+                engine.onUp(event.getPointerId(index), event.getX(index), event.getY(index), event.eventTime)
                 scheduleTick()
             }
 
             MotionEvent.ACTION_UP -> {
                 val command = pressedCommand
+                val candidate = pressedCandidate
                 if (command != null) {
                     pressedCommand = null
                     if (commandAt(event.x, event.y) == command) {
                         performHaptic()
                         listener?.onCommand(command)
+                    }
+                    invalidate()
+                } else if (candidate != null) {
+                    pressedCandidate = null
+                    if (chipAt(event.x, event.y) == candidate) {
+                        performHaptic()
+                        listener?.onSelectCandidate(candidate)
                     }
                     invalidate()
                 } else {
@@ -346,6 +429,7 @@ class KeyboardView @JvmOverloads constructor(
                     engine.onCancel(event.getPointerId(index), event.eventTime)
                 }
                 pressedCommand = null
+                pressedCandidate = null
                 invalidate()
             }
         }
@@ -360,6 +444,12 @@ class KeyboardView @JvmOverloads constructor(
     private fun commandAt(x: Float, y: Float): Command? =
         buttons.firstOrNull { it.second.contains(x, y) }?.first
 
+    private fun chipAt(x: Float, y: Float): Int? {
+        val visible = minOf(candidates.size, chips.size)
+        if (visible == 0) return null
+        return chips.take(visible).firstOrNull { it.second.contains(x, y) }?.first
+    }
+
     private fun scheduleTick() {
         removeCallbacks(tickRunnable)
         postDelayed(tickRunnable, syncWindowMs + 40L)
@@ -371,7 +461,7 @@ class KeyboardView @JvmOverloads constructor(
     }
 
     private fun rejectionText(reason: GestureEngine.RejectionReason): String = when (reason) {
-        GestureEngine.RejectionReason.INCOMPLETE_DIRECTIONS -> "Move both thumbs to a corner"
+        GestureEngine.RejectionReason.INCOMPLETE_DIRECTIONS -> "Move both thumbs"
         GestureEngine.RejectionReason.FINGERS_OUT_OF_SYNC -> "Both thumbs must land together"
         GestureEngine.RejectionReason.OUT_OF_ZONE -> "Finger left its pad"
         GestureEngine.RejectionReason.CANCELLED -> "Gesture cancelled"
@@ -382,7 +472,13 @@ class KeyboardView @JvmOverloads constructor(
         toolbarPaint.color = if (darkTheme) Color.parseColor("#161D28") else Color.parseColor("#FFFFFF")
         pressedPaint.color = if (darkTheme) Color.parseColor("#2C4472") else Color.parseColor("#CBD9F5")
         previewPaint.color = if (darkTheme) Color.parseColor("#121924") else Color.parseColor("#FFFFFF")
+        chipPaint.color = if (darkTheme) Color.parseColor("#1B2431") else Color.parseColor("#FFFFFF")
+        chipSelectedPaint.color = if (darkTheme) Color.parseColor("#2C4472") else Color.parseColor("#CBD9F5")
         iconPaint.color = if (darkTheme) Color.parseColor("#D6DEEC") else Color.parseColor("#2A3448")
         setBackgroundColor(backgroundPaint.color)
+    }
+
+    private companion object {
+        const val MAX_CHIPS = 4
     }
 }

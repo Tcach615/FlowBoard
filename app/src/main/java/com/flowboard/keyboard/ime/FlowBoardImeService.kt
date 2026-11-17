@@ -1,46 +1,109 @@
 package com.flowboard.keyboard.ime
 
 import android.inputmethodservice.InputMethodService
+import android.os.SystemClock
 import android.text.InputType
 import android.view.View
 import android.view.inputmethod.EditorInfo
-import com.flowboard.keyboard.decode.ChordBoard
-import com.flowboard.keyboard.gesture.Chord
 import com.flowboard.keyboard.input.InputController
-import com.flowboard.keyboard.model.Candidate
+import com.flowboard.keyboard.gesture.Chord
 import com.flowboard.keyboard.predict.InMemoryPersonalization
-import com.flowboard.keyboard.predict.PredictionEngine
-import com.flowboard.keyboard.predict.Vocabulary
-import com.flowboard.keyboard.predict.VocabularyParser
 import com.flowboard.keyboard.settings.FlowBoardPreferences
+import com.flowboard.keyboard.steno.LanguageModel
+import com.flowboard.keyboard.steno.StenoDictionary
+import com.flowboard.keyboard.steno.StenoEngine
+import com.flowboard.keyboard.steno.StenoPredictor
+import com.flowboard.keyboard.steno.StenoSession
+import com.flowboard.keyboard.steno.TranslationEngine
 import com.flowboard.keyboard.ui.KeyboardView
+import java.util.zip.GZIPInputStream
 
 /**
- * The system keyboard. It owns the engines and forwards editor operations to
- * [InputController]; the view only reports chords and toolbar commands.
+ * The system keyboard, now driven by FSL-1.
+ *
+ * Ownership is unchanged in spirit: the service owns every engine and decides what is inserted.
+ * What changed is the linguistic layer — the pads emit fixed phonetic symbols, the dictionary and
+ * predictor only *propose*, and text is inserted only when the user commits a translation.
  */
 class FlowBoardImeService : InputMethodService(), KeyboardView.Listener {
 
     private lateinit var preferences: FlowBoardPreferences
-    private lateinit var vocabulary: Vocabulary
-    private lateinit var predictor: PredictionEngine
-    private lateinit var strictPredictor: PredictionEngine
     private lateinit var personalization: InMemoryPersonalization
     private lateinit var controller: InputController
+    private lateinit var engine: StenoEngine
 
-    private val board = ChordBoard()
+    private var dictionary: StenoDictionary = StenoDictionary.empty()
+    private var languageModel: LanguageModel = LanguageModel.empty()
+    private var predictor: StenoPredictor? = null
+    private var translator: TranslationEngine? = null
+    private var session: StenoSession? = null
     private var keyboardView: KeyboardView? = null
     private var sensitive = false
+
+    /** Load failures are surfaced in the preview bar instead of crashing the IME. */
+    private var loadFailure: String? = null
+
+    /** Measured cold-start cost of parsing the bundled assets; reported by the tests/report. */
+    internal var assetLoadMillis: Long = 0L
+        private set
+
+    internal var dictionarySize: Int = 0
+        private set
 
     override fun onCreate() {
         super.onCreate()
         preferences = FlowBoardPreferences(this)
         personalization = InMemoryPersonalization()
-        vocabulary = loadVocabulary(preferences.language)
-        predictor = PredictionEngine(vocabulary, personalization = personalization)
-        // Password fields get no personalization or context reuse.
-        strictPredictor = PredictionEngine(vocabulary, personalization = null)
+        engine = StenoEngine()
         controller = InputController(InputConnectionTarget(null))
+        loadModels()
+    }
+
+    private fun loadModels() {
+        val started = SystemClock.uptimeMillis()
+        runCatching {
+            val loadedDictionary = readGzipAsset("steno_en.tsvz").use { StenoDictionary.load(it) }
+            val loadedModel = readGzipAsset("lm_en.tsvz").use { LanguageModel.load(it) }
+            dictionary = loadedDictionary
+            languageModel = loadedModel
+            dictionarySize = loadedDictionary.size
+        }.onFailure { error ->
+            loadFailure = "Dictionary unavailable: ${error.message ?: error.javaClass.simpleName}"
+            dictionary = StenoDictionary.empty()
+            languageModel = LanguageModel.empty()
+        }
+        attachModels()
+        assetLoadMillis = SystemClock.uptimeMillis() - started
+    }
+
+    /**
+     * Reads a gzip-compressed asset. The suffix is not `.gz` on purpose: aapt2 decompresses and
+     * renames `.gz` assets, so a plain `.tsv` fallback keeps the IME working if a future toolchain
+     * strips the compression again.
+     */
+    private fun readGzipAsset(name: String): java.io.InputStream {
+        val gzipped = runCatching { assets.open(name) }.getOrNull()
+        if (gzipped != null) return GZIPInputStream(gzipped)
+        val plain = name.removeSuffix("z")
+        return assets.open(plain)
+    }
+
+    private fun attachModels() {
+        if (dictionary.size == 0) {
+            predictor = StenoPredictor(dictionary, languageModel)
+            translator = TranslationEngine(engine, predictor!!)
+            session = StenoSession(engine, translator!!, predictor!!)
+            return
+        }
+        val stenoPredictor = StenoPredictor(
+            dictionary = dictionary,
+            languageModel = languageModel,
+            personalization = personalization
+        )
+        val translationEngine = TranslationEngine(engine, stenoPredictor)
+        predictor = stenoPredictor
+        translator = translationEngine
+        session = StenoSession(engine, translationEngine, stenoPredictor, personalization)
     }
 
     override fun onCreateInputView(): View {
@@ -48,7 +111,8 @@ class FlowBoardImeService : InputMethodService(), KeyboardView.Listener {
         view.listener = this
         view.applyPreferences(preferences)
         keyboardView = view
-        refreshBoard(assign = true)
+        loadFailure?.let { view.showStatus(it) }
+        refresh()
         return view
     }
 
@@ -58,21 +122,21 @@ class FlowBoardImeService : InputMethodService(), KeyboardView.Listener {
         controller.target = InputConnectionTarget(currentInputConnection)
         controller.setSensitive(sensitive)
         controller.resetForEditor()
-        board.clear()
-        refreshBoard(assign = true)
+        session?.resetForEditor()
+        if (sensitive) session?.context?.clear()
+        refresh()
     }
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         controller.target = InputConnectionTarget(currentInputConnection)
-        // Pick up settings changed while the keyboard was hidden.
         keyboardView?.applyPreferences(preferences)
         keyboardView?.setPrivateMode(sensitive)
-        refreshBoard(assign = true)
+        refresh()
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
-        controller.clearComposing()
+        session?.clearSketch()
         keyboardView?.resetGesture()
         super.onFinishInputView(finishingInput)
     }
@@ -90,73 +154,92 @@ class FlowBoardImeService : InputMethodService(), KeyboardView.Listener {
         super.onUpdateSelection(
             oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd
         )
-        // The editor dropped our composing region (cursor moved, field switched): stay in sync.
-        if (candidatesStart < 0 && controller.composingText.isNotEmpty()) {
-            controller.onEditorSelectionChanged()
-            refreshBoard(assign = true)
-            updatePreview()
+        // The cursor moved outside anything we were composing: drop the half-written sketch so a
+        // later commit cannot insert a word meant for the old caret position.
+        if (candidatesStart < 0 && (session?.chordCount ?: 0) > 0) {
+            session?.clearSketch()
+            refresh()
         }
     }
 
     override fun onChord(chord: Chord) {
-        val candidate = board.candidateFor(chord)
-        if (candidate == null) {
-            keyboardView?.showStatus("No candidate on ${chord.left.label} + ${chord.right.label}")
-            return
+        val current = session ?: return
+        val state = current.addChord(chord)
+        if (!sensitive) preferences.recordChord()
+        keyboardView?.setSession(state)
+        keyboardView?.setPrivateMode(sensitive)
+        val preview = when (val translation = state.translation) {
+            is com.flowboard.keyboard.steno.Translation.Candidates -> translation.top.entry.word
+            is com.flowboard.keyboard.steno.Translation.Incomplete ->
+                if (state.chordCount == 1) translation.reason else ""
+            com.flowboard.keyboard.steno.Translation.Empty -> ""
         }
-        controller.insert(candidate)
-        if (!sensitive) {
-            if (preferences.personalizationEnabled) personalization.record(candidate.text)
-            preferences.recordChord()
-        }
-        keyboardView?.showStatus("${chord.left.label} + ${chord.right.label}  ·  ${candidate.text.trim()}")
-        refreshBoard(assign = false)
-        updatePreview()
+        keyboardView?.showStatus(preview)
     }
 
     override fun onCommand(command: KeyboardView.Command) {
+        val current = session ?: return
         when (command) {
             KeyboardView.Command.BACKSPACE -> {
-                controller.backspace()
-                refreshBoard(assign = false)
+                if (current.backspace()) {
+                    refresh()
+                    keyboardView?.showStatus("Stroke removed")
+                } else {
+                    controller.backspace()
+                }
             }
-            KeyboardView.Command.SPACE -> {
-                controller.insertSpace()
-                refreshBoard(assign = true)
-            }
-            KeyboardView.Command.COMPLETE -> {
-                controller.completeToken()
-                refreshBoard(assign = true)
-            }
+
+            KeyboardView.Command.SPACE -> commit(withSpace = true)
+
+            KeyboardView.Command.COMPLETE -> commit(withSpace = false)
+
             KeyboardView.Command.UNDO -> {
-                if (controller.undo()) {
-                    preferences.recordCorrection()
-                    refreshBoard(assign = true)
+                val deleted = current.undo()
+                if (deleted != null) {
+                    controller.target.deleteBackward(deleted.length)
+                    if (!sensitive) preferences.recordCorrection()
+                    refresh()
+                    keyboardView?.showStatus("Undone")
+                } else if (current.backspace()) {
+                    refresh()
                 }
             }
+
             KeyboardView.Command.ALTERNATIVES -> {
-                if (controller.undo()) {
-                    preferences.recordCorrection()
-                    refreshBoard(assign = false)
-                }
+                val index = current.cycleAlternative()
+                val count = current.candidates().size
+                refresh()
+                keyboardView?.showStatus(if (count > 0) "Alternative ${index + 1}/$count" else "No alternatives")
+                if (count > 1 && !sensitive) preferences.recordCorrection()
             }
         }
-        updatePreview()
     }
 
-    private fun refreshBoard(assign: Boolean) {
-        val candidates: List<Candidate> =
-            (if (sensitive) strictPredictor else predictor).predict(controller.context, CANDIDATE_SLOTS)
-        if (assign) board.update(candidates)
-        keyboardView?.let { view ->
-            view.setBoard(board.current)
-            view.setPrivateMode(sensitive)
+    override fun onSelectCandidate(index: Int) {
+        val current = session ?: return
+        current.select(index)
+        commit(withSpace = true)
+    }
+
+    private fun commit(withSpace: Boolean) {
+        val current = session ?: return
+        val text = current.accept(withSpace, remember = !sensitive)
+        if (text == null) {
+            keyboardView?.showStatus("Not a word yet")
+            return
         }
-        updatePreview()
+        controller.target.commitText(text)
+        controller.target.finishComposing()
+        // A password field keeps no linguistic state: no personalisation, no context.
+        if (sensitive) current.context.clear()
+        refresh()
+        keyboardView?.showStatus(text.trim())
     }
 
-    private fun updatePreview() {
-        keyboardView?.setComposingPreview(controller.composingText)
+    private fun refresh() {
+        val current = session ?: return
+        keyboardView?.setSession(current.snapshot())
+        keyboardView?.setPrivateMode(sensitive)
     }
 
     private fun isSensitive(info: EditorInfo?): Boolean {
@@ -173,21 +256,5 @@ class FlowBoardImeService : InputMethodService(), KeyboardView.Listener {
             InputType.TYPE_CLASS_NUMBER -> variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
             else -> false
         }
-    }
-
-    private fun loadVocabulary(language: String): Vocabulary {
-        val assetName = "vocabulary_$language.json"
-        val json = runCatching {
-            assets.open(assetName).bufferedReader().use { it.readText() }
-        }.recoverCatching {
-            assets.open("vocabulary_en.json").bufferedReader().use { it.readText() }
-        }.getOrNull()
-        if (json == null) return Vocabulary(com.flowboard.keyboard.predict.VocabularyData(language = "en"))
-        return runCatching { Vocabulary(VocabularyParser.parse(json)) }
-            .getOrElse { Vocabulary(com.flowboard.keyboard.predict.VocabularyData(language = "en")) }
-    }
-
-    private companion object {
-        const val CANDIDATE_SLOTS = 16
     }
 }

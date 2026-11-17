@@ -31,7 +31,12 @@ class ZoneRenderer(context: Context) {
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create("sans-serif", Typeface.NORMAL)
     }
+    private val highlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.2f * density
+    }
     private var labelColor = Color.parseColor("#E7ECF6")
+    private var highlightColor = Color.parseColor("#7FA8FF")
 
     init {
         setDarkTheme(true)
@@ -47,6 +52,7 @@ class ZoneRenderer(context: Context) {
             labelColor = Color.parseColor("#E7ECF6")
             labelPaint.color = labelColor
             rolePaint.color = Color.parseColor("#8FA0BD")
+            highlightColor = Color.parseColor("#7FA8FF")
         } else {
             padFill.color = Color.parseColor("#E9EDF5")
             padStroke.color = Color.parseColor("#C3CCDD")
@@ -56,6 +62,7 @@ class ZoneRenderer(context: Context) {
             labelColor = Color.parseColor("#1A2333")
             labelPaint.color = labelColor
             rolePaint.color = Color.parseColor("#5A6A85")
+            highlightColor = Color.parseColor("#2F62D8")
         }
     }
 
@@ -68,10 +75,12 @@ class ZoneRenderer(context: Context) {
         rightActive: Direction?,
         leftConnected: Boolean,
         rightConnected: Boolean,
-        showLabels: Boolean
+        showLabels: Boolean,
+        leftHighlights: Map<Direction, Float> = emptyMap(),
+        rightHighlights: Map<Direction, Float> = emptyMap()
     ) {
-        drawPad(canvas, FingerRole.LEFT, layout, leftLabels, leftActive, leftConnected, showLabels, "LEFT")
-        drawPad(canvas, FingerRole.RIGHT, layout, rightLabels, rightActive, rightConnected, showLabels, "RIGHT")
+        drawPad(canvas, FingerRole.LEFT, layout, leftLabels, leftActive, leftConnected, showLabels, "LEFT", leftHighlights)
+        drawPad(canvas, FingerRole.RIGHT, layout, rightLabels, rightActive, rightConnected, showLabels, "RIGHT", rightHighlights)
     }
 
     private fun drawPad(
@@ -82,7 +91,8 @@ class ZoneRenderer(context: Context) {
         active: Direction?,
         connected: Boolean,
         showLabels: Boolean,
-        roleLabel: String
+        roleLabel: String,
+        highlights: Map<Direction, Float>
     ) {
         val cx = layout.centerX(role)
         val cy = layout.centerY(role)
@@ -114,6 +124,14 @@ class ZoneRenderer(context: Context) {
             val label = labels[direction]?.takeIf { showLabels && it.isNotBlank() } ?: "·"
             labelPaint.color = if (isActive) Color.WHITE else if (showLabels) labelColor else rolePaint.color
             drawFittedText(canvas, label, tileCx, tileCy + radius * 0.055f, radius * 0.20f, tileSize * 0.84f)
+
+            // Prediction highlight: a ring, never a label change, so the mapping stays readable.
+            val strength = highlights[direction] ?: 0f
+            if (strength > 0.01f) {
+                highlightPaint.color = highlightColor
+                highlightPaint.alpha = (70 + 150 * strength.coerceIn(0f, 1f)).toInt()
+                canvas.drawRoundRect(rect, corner, corner, highlightPaint)
+            }
         }
 
         rolePaint.textSize = radius * 0.10f

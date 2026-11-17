@@ -51,7 +51,14 @@ class SettingsActivity : Activity() {
         )
 
         root.addView(title("FlowBoard"))
-        root.addView(body("Adaptive Dual-Chord Input. Two thumbs, four directions each, sixteen chords."))
+        root.addView(
+            body(
+                "FlowBoard writes with FSL-1, a stenographic alphabet: the left thumb picks an " +
+                    "onset family and the right thumb a vowel family, so one chord is one syllable " +
+                    "core. Stroke several chords to spell a word; the board above shows the " +
+                    "dictionary's readings of what you have stroked."
+            )
+        )
 
         root.addView(section("Activation"))
         root.addView(body("FlowBoard must be enabled in the system keyboard settings, then selected as the current keyboard."))
@@ -91,8 +98,11 @@ class SettingsActivity : Activity() {
         root.addView(body("Movement smaller than this share of the pad radius counts as no direction."))
 
         root.addView(section("Display"))
-        root.addView(switchRow("Candidate labels on the pads", prefs.showCandidateLabels) {
+        root.addView(switchRow("Alphabet labels on the pads", prefs.showCandidateLabels) {
             prefs.showCandidateLabels = it
+        })
+        root.addView(switchRow("Highlight likely next chords", prefs.predictionHighlights) {
+            prefs.predictionHighlights = it
         })
         root.addView(switchRow("Light theme", prefs.theme == "light") {
             prefs.theme = if (it) "light" else "dark"
@@ -119,7 +129,8 @@ class SettingsActivity : Activity() {
         })
         root.addView(
             body(
-                "Typed text is never transmitted. FlowBoard has no INTERNET permission and no analytics. " +
+                "Typed text is never transmitted. The dictionary and language model ship inside the app, " +
+                    "and FlowBoard has no INTERNET permission and no analytics. " +
                     "The keyboard keeps the last few committed words in memory for prediction, and stores " +
                     "settings plus a typing counter in this app's private storage. Password fields use a " +
                     "stateless predictor and are never recorded."

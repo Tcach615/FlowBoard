@@ -31,6 +31,11 @@ class FlowBoardPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_LABELS, true)
         set(value) = prefs.edit().putBoolean(KEY_LABELS, value).apply()
 
+    /** Highlight likely next chords. Highlight-only: never removes a chord. */
+    var predictionHighlights: Boolean
+        get() = prefs.getBoolean(KEY_HIGHLIGHTS, true)
+        set(value) = prefs.edit().putBoolean(KEY_HIGHLIGHTS, value).apply()
+
     var personalizationEnabled: Boolean
         get() = prefs.getBoolean(KEY_PERSONALIZATION, true)
         set(value) = prefs.edit().putBoolean(KEY_PERSONALIZATION, value).apply()
@@ -70,6 +75,7 @@ class FlowBoardPreferences(context: Context) {
         private const val KEY_DEAD_ZONE = "dead_zone"
         private const val KEY_HAPTICS = "haptics"
         private const val KEY_LABELS = "candidate_labels"
+        private const val KEY_HIGHLIGHTS = "prediction_highlights"
         private const val KEY_PERSONALIZATION = "personalization"
         private const val KEY_THEME = "theme"
         private const val KEY_ONBOARDING = "onboarding_complete"

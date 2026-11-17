@@ -138,3 +138,27 @@ Compare with `docs/headless/onboarding-1-welcome.png`, `onboarding-2-chords.png`
 For anything that fails, note the device model, Android version, app, and what you did just before
 it failed. The gesture state machine and rejection reasons are the most likely places for a real
 device to differ from the headless run.
+
+## FSL-1 (1.1.0) device checklist
+
+The 1.1.0 APK (`dist/flowboard-1.1.0-debug.apk`) has not been run on a physical device. Run these
+checks on the Redmi Note 14 Pro (Android 16) before calling the release device-verified.
+
+1. Install, enable FlowBoard in *Manage keyboards*, select it as the input method.
+2. In a third-party app (Messages), stroke `COR·A` (both thumbs NE). Nothing is inserted; the preview
+   bar shows `COR·A` and the top reading; chips appear above the pads.
+3. Press `␣`: the word plus a space is inserted and the strip clears.
+4. Stroke `COR·F` then `COR·∅`; tap the third chip: that reading is committed with a space.
+5. Stroke `COR·F COR·∅` again, press `⇄` twice, then `✓`: the third reading is committed without a
+   trailing space.
+6. Press `↺`: the word disappears and its strokes return to the preview; commit a different reading.
+7. Press `⌫` with strokes present (removes one stroke, text untouched), then with no strokes (deletes
+   a character).
+8. Type in a password field: the preview shows `PRIVATE`, text still inserts, and *Chords committed*
+   in settings does not increase.
+9. Toggle *Highlight likely next chords* and *Alphabet labels on the pads*; reopening the keyboard
+   reflects both.
+10. Rotate the device mid-sketch: the layout re-flows and the sketch survives.
+11. Two-thumb comfort: try 10 words; note reach, accidental single-thumb landings and any rejected
+    chord that felt like a correct stroke (that is the sync window being too tight).
+12. Long sketch (6+ strokes): preview and chips stay readable, toolbar stays reachable.
